@@ -1,0 +1,70 @@
+using System;
+using System.Threading;
+
+namespace CADIS.Solution.Workflow
+{
+    /// <summary>
+    /// Sends periodic heartbeats to the server, including local and server timestamps.
+    /// </summary>
+    internal class ServerTimeHeartbeat : IDisposable
+    {
+        private readonly Timer _timer;
+        private readonly int _intervalMs;
+        private readonly object _lock = new object();
+
+        private bool _disposed;
+
+        /// <summary>
+        /// Raised every time a heartbeat is sent.
+        /// Provides both local and server time.
+        /// </summary>
+        public event Action<DateTime, DateTime> OnHeartbeat;
+
+        public ServerTimeHeartbeat(int intervalMs = 5000)
+        {
+            _intervalMs = intervalMs;
+            _timer = new Timer(SendHeartbeat, null, _intervalMs, _intervalMs);
+        }
+
+        private void SendHeartbeat(object state)
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+
+                try
+                {
+                    DateTime localTime = DateTime.UtcNow;
+                    DateTime serverTime = GetServerTime();
+
+                    OnHeartbeat?.Invoke(localTime, serverTime);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ServerTimeHeartbeat] Error: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Placeholder for server time retrieval.
+        /// Replace with actual server API call or DB query.
+        /// </summary>
+        private DateTime GetServerTime()
+        {
+            // For demo: assume server time is UTC
+            return DateTime.UtcNow;
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                _timer?.Dispose();
+            }
+        }
+    }
+}
