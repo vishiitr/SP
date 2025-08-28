@@ -1,0 +1,354 @@
+using System;
+using CADIS.Common;
+using CADIS.Base;
+using CADIS.Process;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+
+namespace CADIS.Solution.Workflow
+{
+	/// <summary>
+	/// Manages the multi-threaded running of a Solution Workflow, including the complex branch/join logic
+	/// </summary>
+	internal class ThreadManager : IThreadManager
+	{
+		// Use a queue to ensure the order of logging is maintained
+		// Concurrent because this class must be threadsafe
+		ConcurrentQueue<KeyValuePair<Int64, String>> mLog;
+
+		Int32 mCurrentThreads = 0;
+		Int32 mMaxThreads;
+		Queue<IRunStep> mQueue = new Queue<IRunStep>();
+		Object mQueueLock = new Object();
+
+		bool mAborted = false;
+		System.Threading.ManualResetEvent mAbortEvent;
+
+		Int32 mTopLevelRunID;
+		Int32 mParentRunID;
+		Int32 mRunID;
+		LockingSystem mParentLockMode;
+
+		IWorkflowController mController;
+
+		public ThreadManager(Messaging.RunInfo parentRunInfo, Int32 maxThreads, IWorkflowController controller, IRunStep startStep)
+		{
+			mLog = new ConcurrentQueue<KeyValuePair<Int64, String>>();
+
+			mTopLevelRunID = parentRunInfo.TopLevelRunID;
+			mParentRunID = parentRunInfo.ParentRunID;
+			mRunID = parentRunInfo.RunID;
+			mParentLockMode = parentRunInfo.ParentLockMode;
+
+			mController = controller;
+
+			mMaxThreads = maxThreads;
+			mAbortEvent = new System.Threading.ManualResetEvent(false);
+
+			// Add the starting step to the queue ready for it to start when StartNext is called
+			QueueThread(startStep);
+		}
+
+		/// <summary>
+		/// Attempt to start the steps on the queue, up to the maximum number of threads we are permitted to run
+		/// </summary>
+		public void StartNext()
+		{
+			List<Int32> startedKeys = new List<Int32>();
+
+			lock (mQueueLock)
+			{
+				// The ThreadPool should be safe to use as there are typically 1023 threads available, and
+				// even with a complex nested solution containing Data Flow components we're unlikely to run out
+				int worker, port;
+				System.Threading.ThreadPool.GetAvailableThreads(out worker, out port);
+				if (worker <= 0)
+				{
+					LogMessage("Ran out of threadpool threads");
+					// Quit gracefully
+					RequestStop();
+				}
+				else
+				{
+					// If we have spare threads (in our count) and items left on the queue, start them off
+					while (mCurrentThreads < mMaxThreads && mQueue.Count > 0)
+					{
+						// Pick next runstep off the top of the queue
+						IRunStep rs = mQueue.Dequeue();
+						startedKeys.Add(rs.Key);
+
+						// Increase the counter as we're about to start this thread
+						mCurrentThreads++;
+
+						// Start the new thread
+						System.Threading.ThreadPool.QueueUserWorkItem(rs.Run);
+					}
+				}
+
+				LogMessage("********** Starting next steps *********");
+				foreach (Int32 k in startedKeys)
+				{
+					LogMessage("TM: Starting " + k + ", threads: " + mCurrentThreads + ", queue: " + mQueue.Count);
+				}
+				LogMessage("Queue contains keys: ");
+				foreach (IRunStep item in mQueue)
+				{
+					LogMessage(item.Key.ToString());
+				}
+
+				if (mQueue.Count == 0 && mCurrentThreads == 0)
+				{
+					// Notify the UI that we've finished
+					NotifyAllComplete();
+				}
+			}
+		}
+
+		// Abort the run.  Stop any more items from being queued in the future, and clear the existing queue
+		public void RequestStop()
+		{
+			lock (mQueueLock)
+			{
+				// Running steps check this signal
+				mAbortEvent.Set();
+				// New steps check this flag
+				mAborted = true;
+				// Remove any pending steps
+				while (mQueue.Count > 0)
+				{
+					mQueue.Dequeue();
+				}
+			}
+			LogMessage("Stop requested, threads: " + mCurrentThreads + ", queue: " + mQueue.Count);
+		}
+
+		// Must be called within a lock statement as it manipulates the queue
+		void QueueThread(IRunStep rs)
+		{
+			// Don't queue if the abort flag has been set.  Just allow the current steps to complete
+			if (mAborted) return;
+
+			// Add the specified item to the queue, but don't start it yet
+			mQueue.Enqueue(rs);
+
+			LogMessage("Queued " + rs.Title + "(" + rs.Key + "), threads: " + mCurrentThreads + ", queue: " + mQueue.Count);
+		}
+
+		// Must be called within a lock statement as it manipulates the queue
+		void ReleaseThread(IRunStep rs, bool andStartNext)
+		{
+			LogMessage("Releasing thread for " + rs.Title + "(" + rs.Key + ").  Threads: " + mCurrentThreads + ", queue: " + mQueue.Count);
+
+			mCurrentThreads--;
+			if (mCurrentThreads < 0) throw new InvalidReleaseException();
+
+			if (andStartNext)
+			{
+				StartNext();
+			}
+		}
+
+		void NotifyStepStart(IRunStep rs)
+		{
+			LogMessage(rs.Title + "(" + rs.Key + "): Started");
+			mController.Started(rs.Key);
+		}
+		void NotifyStepEnd(IRunStep rs, RunResultInfo resultInfo)
+		{
+			LogMessage(rs.Title + "(" + rs.Key + "): Completed");
+			mController.Completed(rs.Key, resultInfo);
+		}
+
+		// All the workflow steps have completed one way or another (they may also have aborted)
+		void NotifyAllComplete()
+		{
+			LogMessage("Execution stopped.");
+			if (mAborted)
+			{
+				mController.Stopped(RunResult.Aborted, null);
+			}
+			else
+			{
+				mController.Stopped(RunResult.Success, null);
+			}
+		}
+
+		// Log a debug message in memory with high-granularity so we can see the order in which the multithreaded events happen
+		public void LogMessage(string msg)
+		{
+			// Concurrent queue is thread safe, so no lock required
+			mLog.Enqueue(new KeyValuePair<Int64, String>(DateTime.Now.Ticks, msg));
+		}
+		public ConcurrentQueue<KeyValuePair<Int64, String>> LogMessages
+		{
+			get { return mLog; }
+		}
+
+		#region IThreadManager - called by RunStepBase classes
+
+		int IThreadManager.TopLevelRunID
+		{
+			get { return mTopLevelRunID; }
+		}
+		int IThreadManager.ParentRunID
+		{
+			get { return mParentRunID; }
+		}
+		int IThreadManager.RunID
+		{
+			get { return mRunID; }
+		}
+		LockingSystem IThreadManager.ParentLockMode
+		{
+			get { return mParentLockMode; }
+		}
+
+		bool IThreadManager.HasAborted(int millisecondsToWait)
+		{
+			return mAbortEvent.WaitOne(millisecondsToWait, false);
+		}
+
+		// =======================================================================================
+		// Pre-run functionality:
+		//
+		// 1) If my step status is not "NotRun" then immediately release the thread that I've been given and quit.  This happens
+		//     because often there are multiple entries for a step on the queue, and the first one which can run does so.  Others then
+		//     call this again, but don't need to run because the step has done so already.
+		//
+		// 2) Check all the previous steps have completed before running this step.  This is a basic prerequisite of the work flow.
+		//     If not all the steps have run, we quit and way for this step to be rerun at a later point when all have completed.
+		//
+		// 3) Check that if this step is the end-point of a decision branch that at least one of the branches has run before 
+		//    continuing. (We ignore any decision branches where the root node has not executed as the skipping will already have 
+		//    been handled
+		//
+		// 4) Finally set this step's status to "Running" to indicate that it is in progress (and cannot be modified) before releasing the lock
+		//
+		// All of this is critical, and cannot be interrupted by another thread.  Hence it is wrapped up in a SyncLock block
+		// =======================================================================================
+		bool IThreadManager.StepCanStart(IRunStep rs)
+		{
+			lock (mQueueLock)
+			{
+				if (rs.RunResult != RunResult.NotRun)
+				{
+					ReleaseThread(rs, true);
+					LogMessage(rs.Title + "(" + rs.Key.ToString() + "): Quitting because step is already running or has already run.");
+					return false;
+				}
+
+				foreach (RunStepInfo prs in rs.ImmedPrevSteps)
+				{
+					if (prs.RunStep.StepNotComplete)
+					{
+						ReleaseThread(rs, true);
+						LogMessage(rs.Title + "(" + rs.Key.ToString() + "): Quitting because not all previous steps have completed.");
+						return false;
+					}
+				}
+
+				if (!rs.ShouldRun)
+				{
+					((IThreadManager)this).StepCompleted(rs, new RunResultInfo(RunResult.Skipped));
+					LogMessage(rs.Title + "(" + rs.Key.ToString() + "): Quitting because the run expression evaluated to false: " + rs.RunExpression.ToString());
+					return false;
+				}
+
+				rs.RunResult = RunResult.Running;
+
+				NotifyStepStart(rs);
+				return true;
+			}
+		}
+
+		// =======================================================================================
+		// Post-run functionality:
+		//
+		// 1) Queue up all next steps ready to be run.  Each step is responsible for whether it should actually run according
+		//     to the state of its previous steps
+		//
+		// 2) Set my actual run result property to be the runResult specified
+		//
+		// 3) Remove the thread that I'm running on from the thread count
+		//
+		// All of this must be atomic, it cannot be interrupted by another thread.  Hence it is wrapped up in a lock block
+		// =======================================================================================
+		void IThreadManager.StepCompleted(IRunStep rs, RunResultInfo runResultInfo)
+		{
+			lock (mQueueLock)
+			{
+				LogMessage("********** Step Completed for " + rs.Title + "(" + rs.Key + ") *********");
+				LogMessage("Result: " + runResultInfo.RunResult.ToString());
+
+				foreach (RunStepInfo nrs in rs.ImmedNextSteps)
+				{
+					// Queue all next steps. The step itself takes responsibility for deciding whether or not it will run.
+					QueueThread(nrs.RunStep);
+				}
+
+				// Finally set the step's status
+				rs.RunResultInfo = runResultInfo;
+
+				// And release the thread that this step is running on.  Don't start another inside the lock, that will be handled below
+				ReleaseThread(rs, false);
+			}
+
+			// Inform the UI
+			NotifyStepEnd(rs, runResultInfo);
+
+			// Now that we're done, kick off the next steps if there are any
+			StartNext();
+		}
+
+		void IThreadManager.NotifyFailure(Exception ex)
+		{
+			LogMessage("Failure notified, threads: " + mCurrentThreads + ", queue: " + mQueue.Count + Environment.NewLine + Environment.NewLine + ex.Message);
+			lock (mQueueLock)
+			{
+				while (mQueue.Count > 0)
+				{
+					mQueue.Dequeue();
+				}
+			}
+			mController.Stopped(RunResult.FailureAbort, ex);
+		}
+
+		void IThreadManager.NotifyIterationStarted(int key, int iteration)
+		{
+			LogMessage(key + ": Iteration " + iteration + " started");
+			mController.IterationStarted(key, iteration);
+		}
+		void IThreadManager.NotifyIterationCompleted(int key, int iteration, RunResultInfo resultInfo)
+		{
+			LogMessage(key + ": Iteration " + iteration + " completed");
+			mController.IterationCompleted(key, iteration, resultInfo);
+		}
+
+		// Used to send an overall workflow success/failure status back to the workflow
+		void IThreadManager.SetWorkflowRunResult(RunResult result)
+		{
+			mController.UpdateWorkflowRunResult(result);
+		}
+		// Used to send the overall return code integer value back to the workflow
+		void IThreadManager.SetWorkflowReturnCode(UserResultCode resultCode)
+		{
+			mController.UpdateWorkflowReturnCode(resultCode);
+		}
+
+		void IThreadManager.LogMessage(string msg)
+		{
+			LogMessage(msg);
+		}
+
+		#endregion
+
+		public class InvalidReleaseException : Exception
+		{
+			public override string Message
+			{
+				get { return "Cannot release more threads than have been allocated"; }
+			}
+		}
+
+	}
+}
